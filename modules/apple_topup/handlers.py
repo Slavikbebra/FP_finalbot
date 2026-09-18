@@ -745,7 +745,17 @@ async def on_new_message(bot, event):
     if not message:
         return
 
-    text = (message.text or "").strip()
+    # Нормализация текста команды: убираем невидимые Unicode-символы и
+    # приводим пробелы к обычному виду. Это защищает команды вида !могу /
+    # !не могу от скрытых символов, которые иногда появляются в сообщениях.
+    raw_text = message.text or ""
+    text = (
+        raw_text
+        .replace("\u200b", "")
+        .replace("\ufeff", "")
+        .replace("\u2060", "")
+        .strip()
+    )
 
     # ============================================================
     # 1. СИСТЕМНОЕ СООБЩЕНИЕ FUNPAY ОБ ОПЛАТЕ
@@ -773,6 +783,10 @@ async def on_new_message(bot, event):
                 return
 
             await start_paid_order(bot, order)
+            logger.info(
+                "🍎 Apple TopUp DEBUG: обработка оплаты завершена для заказа %s",
+                order_id,
+            )
 
         return
 
@@ -789,13 +803,26 @@ async def on_new_message(bot, event):
     order = storage.find_active_order(username, chat_id)
 
     if not order:
+        logger.info(
+            "🍎 Apple TopUp DEBUG: сообщение покупателя без активного заказа: "
+            "author=%r chat_id=%r text=%r",
+            username, chat_id, text,
+        )
         return
 
-    text_lower = text.lower()
+    # casefold() надёжнее lower() для Unicode.
+    # Для !не могу дополнительно схлопываем повторные пробелы.
+    text_lower = " ".join(text.casefold().split())
 
     order_id = order["order_id"]
     chat_id = order["chat_id"]
     state = order["state"]
+
+    logger.info(
+        "🍎 Apple TopUp DEBUG: команда получена: order=%s buyer=%r "
+        "chat_id=%r state=%r raw=%r normalized=%r",
+        order_id, username, chat_id, state, raw_text, text_lower,
+    )
 
     # ============================================================
     # !ВВЕЛ
@@ -804,6 +831,16 @@ async def on_new_message(bot, event):
     if text_lower == "!ввел":
 
         if state != "CODES_SENT":
+            logger.warning(
+                "🍎 Apple TopUp: !ввел проигнорирована для %s: "
+                "ожидалось CODES_SENT, фактически %r",
+                order_id, state,
+            )
+            bot.send_message(
+                chat_id,
+                f"Сейчас команда !ввел недоступна для текущего этапа заказа. "
+                f"Текущий статус: {state}. Если нужна помощь — !продавец"
+            )
             return
 
         current_order = storage.get_order(order_id)
@@ -846,6 +883,16 @@ async def on_new_message(bot, event):
     if text_lower == "!оформил":
 
         if state != "WAITING_CONFIRMATION":
+            logger.warning(
+                "🍎 Apple TopUp: !оформил проигнорирована для %s: "
+                "ожидалось WAITING_CONFIRMATION, фактически %r",
+                order_id, state,
+            )
+            bot.send_message(
+                chat_id,
+                f"Сейчас команда !оформил недоступна. Текущий статус: {state}. "
+                f"Если нужна помощь — !продавец"
+            )
             return
 
         storage.update_order(
@@ -905,6 +952,16 @@ async def on_new_message(bot, event):
     if text_lower == "!могу":
 
         if state != "WAITING_REGION":
+            logger.warning(
+                "🍎 Apple TopUp: !могу/!не могу проигнорирована для %s: "
+                "ожидалось WAITING_REGION, фактически %r",
+                order_id, state,
+            )
+            bot.send_message(
+                chat_id,
+                f"Сейчас команда смены региона недоступна. Текущий статус: {state}. "
+                f"Если нужна помощь — !продавец"
+            )
             return
 
         # Сначала отправляем текст.
@@ -960,6 +1017,16 @@ async def on_new_message(bot, event):
     if text_lower == "!не могу":
 
         if state != "WAITING_REGION":
+            logger.warning(
+                "🍎 Apple TopUp: !могу/!не могу проигнорирована для %s: "
+                "ожидалось WAITING_REGION, фактически %r",
+                order_id, state,
+            )
+            bot.send_message(
+                chat_id,
+                f"Сейчас команда смены региона недоступна. Текущий статус: {state}. "
+                f"Если нужна помощь — !продавец"
+            )
             return
 
         storage.update_order(
@@ -1037,6 +1104,17 @@ async def on_new_message(bot, event):
             return
 
         if state != "WAITING_REGION_CHANGED":
+            logger.warning(
+                "🍎 Apple TopUp: !сменил проигнорирована для %s: "
+                "ожидалось WAITING_REGION_CHANGED, фактически %r",
+                order_id, state,
+            )
+            bot.send_message(
+                chat_id,
+                f"Сейчас команда !сменил недоступна. Текущий статус: {state}. "
+                f"Сначала используйте !могу, затем после смены региона — !сменил. "
+                f"Если нужна помощь — !продавец"
+            )
             return
 
         # Сначала фиксируем переход в storage.

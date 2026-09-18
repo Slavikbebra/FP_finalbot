@@ -16,7 +16,6 @@ from .handlers import (
     on_funpay_bot_init,
 )
 
-
 BOT_EVENT_HANDLERS = {
     "ON_FUNPAY_BOT_INIT": [
         on_funpay_bot_init,
@@ -24,7 +23,6 @@ BOT_EVENT_HANDLERS = {
 }
 
 FUNPAY_EVENT_HANDLERS = {
-    # NEW_ORDER — основной и надёжный путь запуска Apple TopUp после оплаты.
     EventTypes.NEW_ORDER: [
         on_new_order,
     ],

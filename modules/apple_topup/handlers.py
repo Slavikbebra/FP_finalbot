@@ -422,37 +422,6 @@ async def start_paid_order(bot, order):
                 order_id
             )
 
-async def on_new_order(bot, event):
-    """Основной триггер Apple TopUp: новый оплаченный заказ FunPay."""
-    try:
-        order = getattr(event, "order", None)
-        if not order:
-            logger.error("❌ Apple TopUp: NEW_ORDER получен без order")
-            return
-        logger.info(
-            "🍎 Apple TopUp DEBUG: получен NEW_ORDER order=%s status=%s buyer=%s description=%s",
-            getattr(order, "id", None),
-            getattr(getattr(order, "status", None), "name", getattr(order, "status", None)),
-            getattr(order, "buyer_username", None),
-            getattr(order, "description", None),
-        )
-        if getattr(order, "status", None) != OrderStatuses.PAID:
-            logger.info(
-                "🍎 Apple TopUp DEBUG: NEW_ORDER %s пропущен — статус не PAID",
-                getattr(order, "id", None),
-            )
-            return
-        full_order = await asyncio.to_thread(bot.account.get_order, str(order.id))
-        logger.info(
-            "🍎 Apple TopUp DEBUG: полная информация заказа %s получена; fields=%s",
-            order.id,
-            list((getattr(full_order, "fields", {}) or {}).keys()),
-        )
-        await start_paid_order(bot, full_order)
-    except Exception:
-        logger.exception("❌ Apple TopUp: ошибка обработки NEW_ORDER")
-
-
 async def on_order_status_changed(bot, event):
     """
     Оставляем обработчик статусов для будущего использования.
@@ -472,21 +441,6 @@ async def on_order_status_changed(bot, event):
         order.id,
         order.status
     )
-
-    if order.status == OrderStatuses.PAID:
-        logger.info(
-            "🍎 Apple TopUp DEBUG: ORDER_STATUS_CHANGED -> PAID для заказа %s; запускаем обработку",
-            order.id
-        )
-        try:
-            full_order = await asyncio.to_thread(bot.account.get_order, str(order.id))
-            await start_paid_order(bot, full_order)
-        except Exception:
-            logger.exception(
-                "❌ Apple TopUp: ошибка обработки PAID заказа %s через ORDER_STATUS_CHANGED",
-                order.id
-            )
-        return
 
     if order.status == OrderStatuses.CLOSED:
         existing = storage.get_order(order.id)
@@ -641,10 +595,6 @@ async def on_new_message(bot, event):
         message.author
         and message.author.lower() == "funpay"
     ):
-        logger.info(
-            "🍎 Apple TopUp DEBUG: получено системное сообщение FunPay: %r",
-            text,
-        )
         order_id = extract_order_id(text)
 
         if order_id:

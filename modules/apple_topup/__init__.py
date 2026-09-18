@@ -11,7 +11,6 @@ from .meta import (
 
 from .handlers import (
     on_order_status_changed,
-    on_new_order,
     on_new_message,
     on_funpay_bot_init,
 )
@@ -29,9 +28,6 @@ FUNPAY_EVENT_HANDLERS = {
     ],
     EventTypes.NEW_MESSAGE: [
         on_new_message,
-    ],
-    EventTypes.NEW_ORDER: [
-        on_new_order,
     ],
 }
 

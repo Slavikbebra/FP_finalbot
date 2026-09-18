@@ -289,6 +289,144 @@ def extract_order_id(text: str):
     return match.group(1)
 
 
+
+def _normalize_lot_title(value):
+    """Нормализует название лота для безопасного сравнения."""
+    if value is None:
+        return ""
+    value = str(value).replace("\xa0", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip().casefold()
+
+
+def _resolve_lot_id_from_order(bot, order):
+    """
+    Определяет реальный ID лота Apple TopUp.
+
+    В текущем FunPay API поле offer_id может отсутствовать в API
+    полной информации заказа. Поэтому:
+      1) сначала пробуем offer_id;
+      2) затем сопоставляем название оплаченного заказа
+         с названиями собственных лотов в той же подкатегории;
+      3) рассматриваем только ID из products.PRODUCTS.
+    """
+    # 1. Прямой offer_id, если FunPay его всё-таки передал.
+    try:
+        lot_id = order.get_field_value("offer_id")
+    except Exception:
+        lot_id = None
+
+    if isinstance(lot_id, dict):
+        lot_id = lot_id.get("ru") or lot_id.get("en")
+
+    if lot_id is not None and str(lot_id).strip():
+        lot_id = str(lot_id).strip()
+        if products.get_product(lot_id):
+            return lot_id
+
+    # 2. Получаем название оплаченного лота.
+    order_title = ""
+    try:
+        order_title = order.get_field_value_any("summary") or ""
+    except Exception:
+        pass
+
+    if not order_title:
+        order_title = getattr(order, "title", "") or ""
+
+    normalized_order_title = _normalize_lot_title(order_title)
+
+    if not normalized_order_title:
+        logger.error(
+            "❌ Apple TopUp: не удалось получить название лота для заказа %s",
+            order.id
+        )
+        return None
+
+    # 3. Получаем собственные лоты в той же подкатегории.
+    subcategory = getattr(order, "subcategory", None)
+    if not subcategory:
+        logger.error(
+            "❌ Apple TopUp: у заказа %s отсутствует подкатегория",
+            order.id
+        )
+        return None
+
+    try:
+        own_lots = bot.account.get_my_subcategory_lots(subcategory.id)
+    except Exception:
+        logger.exception(
+            "❌ Apple TopUp: не удалось получить собственные лоты "
+            "подкатегории %s для заказа %s",
+            getattr(subcategory, "id", "?"),
+            order.id
+        )
+        return None
+
+    # Сначала только точное совпадение названия.
+    exact_matches = []
+    for lot in own_lots:
+        lot_id = str(getattr(lot, "id", ""))
+        if not products.get_product(lot_id):
+            continue
+
+        lot_title = getattr(lot, "title", None) or getattr(lot, "description", None)
+        if _normalize_lot_title(lot_title) == normalized_order_title:
+            exact_matches.append(lot_id)
+
+    if len(exact_matches) == 1:
+        logger.info(
+            "🍎 Apple TopUp: offer_id не был передан FunPay; "
+            "лот определён по точному названию: %s",
+            exact_matches[0]
+        )
+        return exact_matches[0]
+
+    if len(exact_matches) > 1:
+        logger.error(
+            "❌ Apple TopUp: найдено несколько Apple TopUp лотов "
+            "с одинаковым названием для заказа %s: %s",
+            order.id,
+            exact_matches
+        )
+        return None
+
+    # Небольшой безопасный fallback: ищем название заказа внутри
+    # названия настроенного лота. Используем только если совпадение
+    # однозначное.
+    partial_matches = []
+    for lot in own_lots:
+        lot_id = str(getattr(lot, "id", ""))
+        if not products.get_product(lot_id):
+            continue
+
+        lot_title = getattr(lot, "title", None) or getattr(lot, "description", None)
+        normalized_lot_title = _normalize_lot_title(lot_title)
+
+        if (
+            normalized_order_title in normalized_lot_title
+            or normalized_lot_title in normalized_order_title
+        ):
+            partial_matches.append(lot_id)
+
+    if len(partial_matches) == 1:
+        logger.info(
+            "🍎 Apple TopUp: offer_id не был передан FunPay; "
+            "лот определён по частичному совпадению названия: %s",
+            partial_matches[0]
+        )
+        return partial_matches[0]
+
+    logger.error(
+        "❌ Apple TopUp: не удалось однозначно определить лот "
+        "для заказа %s. Название заказа: %r; кандидаты: %s",
+        order.id,
+        order_title,
+        partial_matches
+    )
+    return None
+
+
 async def start_paid_order(bot, order):
     """Запускает Apple TopUp-сценарий после обнаружения оплаты."""
 
@@ -302,23 +440,18 @@ async def start_paid_order(bot, order):
 
     try:
         # ---------------------------------------------------------
-        # 1. Определяем товар строго по реальному offer_id заказа.
+        # 1. Определяем реальный ID оплаченного лота.
         # ---------------------------------------------------------
-        fields = getattr(order, "fields", {}) or {}
-        lot_field = fields.get("offer_id")
-        lot_id = getattr(lot_field, "value", None) if lot_field else None
-        if isinstance(lot_id, dict):
-            lot_id = lot_id.get("ru") or lot_id.get("en")
+        lot_id = _resolve_lot_id_from_order(bot, order)
 
-        if lot_id is None or str(lot_id).strip() == "":
+        if lot_id is None:
             logger.error(
-                "❌ Apple TopUp: не удалось определить offer_id для заказа %s. "
+                "❌ Apple TopUp: лот для заказа %s не определён. "
                 "Заказ не обрабатываем.",
                 order_id
             )
             return
 
-        lot_id = str(lot_id).strip()
         product = products.get_product(lot_id)
 
         if not product:
@@ -421,6 +554,33 @@ async def start_paid_order(bot, order):
                 "❌ Apple TopUp: не удалось перевести заказ %s в ERROR после сбоя запуска",
                 order_id
             )
+
+
+async def on_new_order(bot, event):
+    """
+    Основной обработчик оплаченного заказа.
+    FunPay передаёт NEW_ORDER уже со статусом PAID.
+    """
+    if not config.ENABLED:
+        return
+
+    order = getattr(event, "order", None)
+    if not order:
+        logger.warning("🍎 Apple TopUp: NEW_ORDER без объекта order")
+        return
+
+    logger.info(
+        "🍎 Apple TopUp DEBUG: получен NEW_ORDER order=%s status=%s buyer=%s",
+        order.id,
+        getattr(order, "status", None),
+        getattr(order, "buyer_username", None)
+    )
+
+    if order.status != OrderStatuses.PAID:
+        return
+
+    await start_paid_order(bot, order)
+
 
 async def on_order_status_changed(bot, event):
     """

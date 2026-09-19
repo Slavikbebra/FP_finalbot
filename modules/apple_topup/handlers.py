@@ -267,6 +267,138 @@ fazercards = FazerCardsAPI(
 )
 
 
+
+def _normalize_lot_title(value):
+    """Нормализует название лота для безопасного сопоставления."""
+    if value is None:
+        return ""
+    value = str(value).replace("\u200b", "").replace("\ufeff", "")
+    value = re.sub(r"\s+", " ", value).strip().casefold()
+    return value
+
+
+def _resolve_lot_id_from_order(bot, order):
+    """Определяет ID Apple TopUp лота.
+
+    Сначала используется настоящий offer_id. Если FunPay не отдаёт его в
+    объекте заказа, берём summary/title и сопоставляем с собственными лотами
+    той же подкатегории. Ограничиваем результат только лотами из products.py.
+    """
+    # 1. Настоящий offer_id — приоритетный и самый безопасный путь.
+    try:
+        lot_id = order.get_field_value("offer_id")
+    except Exception:
+        lot_id = None
+
+    if isinstance(lot_id, dict):
+        lot_id = lot_id.get("ru") or lot_id.get("en")
+
+    if lot_id is not None and str(lot_id).strip():
+        lot_id = str(lot_id).strip()
+        if products.get_product(lot_id):
+            return lot_id
+
+    # 2. В текущем API название может находиться в summary.
+    order_title = ""
+    for getter in ("summary", "desc", "payment_msg"):
+        try:
+            value = order.get_field_value(getter)
+        except Exception:
+            value = None
+        if isinstance(value, dict):
+            value = value.get("ru") or value.get("en")
+        if value:
+            order_title = str(value)
+            break
+
+    if not order_title:
+        try:
+            order_title = order.get_field_value_any("summary") or ""
+        except Exception:
+            pass
+    if not order_title:
+        order_title = getattr(order, "title", "") or ""
+
+    normalized_order_title = _normalize_lot_title(order_title)
+    if not normalized_order_title:
+        logger.error(
+            "❌ Apple TopUp: не удалось получить название лота для заказа %s",
+            order.id,
+        )
+        return None
+
+    # 3. Сопоставляем только с нашими лотами из products.py.
+    subcategory = getattr(order, "subcategory", None)
+    if not subcategory:
+        logger.error(
+            "❌ Apple TopUp: у заказа %s отсутствует подкатегория; "
+            "offer_id и title недоступны для определения лота",
+            order.id,
+        )
+        return None
+
+    try:
+        own_lots = bot.account.get_my_subcategory_lots(subcategory.id)
+    except Exception:
+        logger.exception(
+            "❌ Apple TopUp: не удалось получить собственные лоты "
+            "подкатегории %s для заказа %s",
+            getattr(subcategory, "id", "?"),
+            order.id,
+        )
+        return None
+
+    exact = []
+    partial = []
+    for lot in own_lots:
+        lot_id = str(getattr(lot, "id", ""))
+        if not products.get_product(lot_id):
+            continue
+        lot_title = getattr(lot, "title", None) or getattr(lot, "description", None)
+        normalized_lot_title = _normalize_lot_title(lot_title)
+        if not normalized_lot_title:
+            continue
+        if normalized_lot_title == normalized_order_title:
+            exact.append(lot_id)
+        elif normalized_order_title in normalized_lot_title or normalized_lot_title in normalized_order_title:
+            partial.append(lot_id)
+
+    if len(exact) == 1:
+        logger.info(
+            "🍎 Apple TopUp: offer_id не был передан FunPay; "
+            "лот определён по точному совпадению названия: %s",
+            exact[0],
+        )
+        return exact[0]
+    if len(exact) > 1:
+        logger.error(
+            "❌ Apple TopUp: несколько Apple TopUp лотов с одинаковым названием "
+            "для заказа %s: %s",
+            order.id, exact,
+        )
+        return None
+
+    if len(partial) == 1:
+        logger.info(
+            "🍎 Apple TopUp: offer_id не был передан FunPay; "
+            "лот определён по частичному совпадению названия: %s",
+            partial[0],
+        )
+        return partial[0]
+    if len(partial) > 1:
+        logger.error(
+            "❌ Apple TopUp: неоднозначное частичное совпадение лота "
+            "для заказа %s: %s; заказ не обрабатываем",
+            order.id, partial,
+        )
+        return None
+
+    logger.error(
+        "❌ Apple TopUp: не найден Apple TopUp лот по названию заказа %s: %r",
+        order.id, order_title,
+    )
+    return None
+
 def extract_order_id(text: str):
     """
     Извлекает ID заказа из системного сообщения FunPay.
@@ -289,144 +421,6 @@ def extract_order_id(text: str):
     return match.group(1)
 
 
-
-def _normalize_lot_title(value):
-    """Нормализует название лота для безопасного сравнения."""
-    if value is None:
-        return ""
-    value = str(value).replace("\xa0", " ")
-    value = re.sub(r"\s+", " ", value)
-    return value.strip().casefold()
-
-
-def _resolve_lot_id_from_order(bot, order):
-    """
-    Определяет реальный ID лота Apple TopUp.
-
-    В текущем FunPay API поле offer_id может отсутствовать в API
-    полной информации заказа. Поэтому:
-      1) сначала пробуем offer_id;
-      2) затем сопоставляем название оплаченного заказа
-         с названиями собственных лотов в той же подкатегории;
-      3) рассматриваем только ID из products.PRODUCTS.
-    """
-    # 1. Прямой offer_id, если FunPay его всё-таки передал.
-    try:
-        lot_id = order.get_field_value("offer_id")
-    except Exception:
-        lot_id = None
-
-    if isinstance(lot_id, dict):
-        lot_id = lot_id.get("ru") or lot_id.get("en")
-
-    if lot_id is not None and str(lot_id).strip():
-        lot_id = str(lot_id).strip()
-        if products.get_product(lot_id):
-            return lot_id
-
-    # 2. Получаем название оплаченного лота.
-    order_title = ""
-    try:
-        order_title = order.get_field_value_any("summary") or ""
-    except Exception:
-        pass
-
-    if not order_title:
-        order_title = getattr(order, "title", "") or ""
-
-    normalized_order_title = _normalize_lot_title(order_title)
-
-    if not normalized_order_title:
-        logger.error(
-            "❌ Apple TopUp: не удалось получить название лота для заказа %s",
-            order.id
-        )
-        return None
-
-    # 3. Получаем собственные лоты в той же подкатегории.
-    subcategory = getattr(order, "subcategory", None)
-    if not subcategory:
-        logger.error(
-            "❌ Apple TopUp: у заказа %s отсутствует подкатегория",
-            order.id
-        )
-        return None
-
-    try:
-        own_lots = bot.account.get_my_subcategory_lots(subcategory.id)
-    except Exception:
-        logger.exception(
-            "❌ Apple TopUp: не удалось получить собственные лоты "
-            "подкатегории %s для заказа %s",
-            getattr(subcategory, "id", "?"),
-            order.id
-        )
-        return None
-
-    # Сначала только точное совпадение названия.
-    exact_matches = []
-    for lot in own_lots:
-        lot_id = str(getattr(lot, "id", ""))
-        if not products.get_product(lot_id):
-            continue
-
-        lot_title = getattr(lot, "title", None) or getattr(lot, "description", None)
-        if _normalize_lot_title(lot_title) == normalized_order_title:
-            exact_matches.append(lot_id)
-
-    if len(exact_matches) == 1:
-        logger.info(
-            "🍎 Apple TopUp: offer_id не был передан FunPay; "
-            "лот определён по точному названию: %s",
-            exact_matches[0]
-        )
-        return exact_matches[0]
-
-    if len(exact_matches) > 1:
-        logger.error(
-            "❌ Apple TopUp: найдено несколько Apple TopUp лотов "
-            "с одинаковым названием для заказа %s: %s",
-            order.id,
-            exact_matches
-        )
-        return None
-
-    # Небольшой безопасный fallback: ищем название заказа внутри
-    # названия настроенного лота. Используем только если совпадение
-    # однозначное.
-    partial_matches = []
-    for lot in own_lots:
-        lot_id = str(getattr(lot, "id", ""))
-        if not products.get_product(lot_id):
-            continue
-
-        lot_title = getattr(lot, "title", None) or getattr(lot, "description", None)
-        normalized_lot_title = _normalize_lot_title(lot_title)
-
-        if (
-            normalized_order_title in normalized_lot_title
-            or normalized_lot_title in normalized_order_title
-        ):
-            partial_matches.append(lot_id)
-
-    if len(partial_matches) == 1:
-        logger.info(
-            "🍎 Apple TopUp: offer_id не был передан FunPay; "
-            "лот определён по частичному совпадению названия: %s",
-            partial_matches[0]
-        )
-        return partial_matches[0]
-
-    logger.error(
-        "❌ Apple TopUp: не удалось однозначно определить лот "
-        "для заказа %s. Название заказа: %r; кандидаты: %s",
-        order.id,
-        order_title,
-        partial_matches
-    )
-    return None
-
-
 async def start_paid_order(bot, order):
     """Запускает Apple TopUp-сценарий после обнаружения оплаты."""
 
@@ -440,15 +434,14 @@ async def start_paid_order(bot, order):
 
     try:
         # ---------------------------------------------------------
-        # 1. Определяем реальный ID оплаченного лота.
+        # 1. Определяем товар строго по реальному offer_id заказа.
         # ---------------------------------------------------------
         lot_id = _resolve_lot_id_from_order(bot, order)
-
-        if lot_id is None:
+        if not lot_id:
             logger.error(
                 "❌ Apple TopUp: лот для заказа %s не определён. "
                 "Заказ не обрабатываем.",
-                order_id
+                order_id,
             )
             return
 
@@ -554,33 +547,6 @@ async def start_paid_order(bot, order):
                 "❌ Apple TopUp: не удалось перевести заказ %s в ERROR после сбоя запуска",
                 order_id
             )
-
-
-async def on_new_order(bot, event):
-    """
-    Основной обработчик оплаченного заказа.
-    FunPay передаёт NEW_ORDER уже со статусом PAID.
-    """
-    if not config.ENABLED:
-        return
-
-    order = getattr(event, "order", None)
-    if not order:
-        logger.warning("🍎 Apple TopUp: NEW_ORDER без объекта order")
-        return
-
-    logger.info(
-        "🍎 Apple TopUp DEBUG: получен NEW_ORDER order=%s status=%s buyer=%s",
-        order.id,
-        getattr(order, "status", None),
-        getattr(order, "buyer_username", None)
-    )
-
-    if order.status != OrderStatuses.PAID:
-        return
-
-    await start_paid_order(bot, order)
-
 
 async def on_order_status_changed(bot, event):
     """
@@ -785,29 +751,50 @@ async def on_new_message(bot, event):
     if not username:
         return
 
-    chat_id = getattr(message, "chat_id", None)
-
-    # Нормализуем текст команды: FunPay/копирование иногда может
-    # передать невидимый Unicode-символ или лишние пробелы.
-    text_lower = (text or "").replace("\u200b", "").replace("\ufeff", "").strip().casefold()
-
-    order = storage.find_active_order(username, chat_id)
-
-    if not order:
-        logger.info(
-            "🍎 Apple TopUp DEBUG: активный заказ НЕ найден: "
-            "author=%r chat_id=%r command=%r",
-            username, chat_id, text_lower
+    # Сообщения самого продавца бот видит как NEW_MESSAGE тоже.
+    # Они никогда не должны обрабатываться как команды покупателя.
+    try:
+        bot_username = getattr(getattr(bot, "account", None), "username", None)
+    except Exception:
+        bot_username = None
+    if bot_username and str(username).lstrip("@").casefold() == str(bot_username).lstrip("@").casefold():
+        logger.debug(
+            "🍎 Apple TopUp DEBUG: сообщение собственного аккаунта пропущено: author=%r",
+            username,
         )
         return
 
+    incoming_chat_id = getattr(message, "chat_id", None)
+    order = storage.find_active_order(username, incoming_chat_id)
+
+    # В разных местах FunPay один и тот же чат может иметь разные chat_id.
+    # Не меняем storage и не ломаем старую схему: если точное совпадение не
+    # найдено, второй поиск выполняем только по стабильному username покупателя.
+    if not order:
+        order = storage.find_active_order(username)
+        if order:
+            logger.warning(
+                "🍎 Apple TopUp DEBUG: заказ найден по username fallback: "
+                "order=%s buyer=%r saved_chat_id=%r incoming_chat_id=%r state=%s",
+                order.get("order_id"), order.get("buyer_username"),
+                order.get("chat_id"), incoming_chat_id, order.get("state"),
+            )
+
+    if not order:
+        return
+
+    text_lower = (text or "").replace("\u200b", "").replace("\ufeff", "").strip().casefold()
+
     order_id = order["order_id"]
-    chat_id = order["chat_id"]
+    # Для ответа используем chat_id входящего сообщения, если он есть.
+    # Это гарантирует ответ именно в текущий чат даже при разных форматах ID.
+    chat_id = incoming_chat_id if incoming_chat_id is not None else order.get("chat_id")
     state = order["state"]
 
     logger.info(
-        "🍎 Apple TopUp DEBUG: команда=%r order=%s state=%s buyer=%r chat_id=%r",
-        text_lower, order_id, state, username, chat_id
+        "🍎 Apple TopUp DEBUG: команда покупателя: author=%r command=%r "
+        "order=%s state=%s incoming_chat_id=%r saved_chat_id=%r",
+        username, text_lower, order_id, state, incoming_chat_id, order.get("chat_id"),
     )
 
     # ============================================================
@@ -817,7 +804,6 @@ async def on_new_message(bot, event):
     if text_lower == "!ввел":
 
         if state != "CODES_SENT":
-            logger.info("🍎 Apple TopUp DEBUG: !ввел отклонена: order=%s state=%s", order_id, state)
             return
 
         current_order = storage.get_order(order_id)
@@ -860,7 +846,6 @@ async def on_new_message(bot, event):
     if text_lower == "!оформил":
 
         if state != "WAITING_CONFIRMATION":
-            logger.info("🍎 Apple TopUp DEBUG: !оформил отклонена: order=%s state=%s", order_id, state)
             return
 
         storage.update_order(
@@ -920,7 +905,6 @@ async def on_new_message(bot, event):
     if text_lower == "!могу":
 
         if state != "WAITING_REGION":
-            logger.info("🍎 Apple TopUp DEBUG: команда смены региона отклонена: order=%s state=%s", order_id, state)
             return
 
         # Сначала отправляем текст.
@@ -976,7 +960,6 @@ async def on_new_message(bot, event):
     if text_lower == "!не могу":
 
         if state != "WAITING_REGION":
-            logger.info("🍎 Apple TopUp DEBUG: команда смены региона отклонена: order=%s state=%s", order_id, state)
             return
 
         storage.update_order(
@@ -1054,7 +1037,6 @@ async def on_new_message(bot, event):
             return
 
         if state != "WAITING_REGION_CHANGED":
-            logger.info("🍎 Apple TopUp DEBUG: !сменил отклонена: order=%s state=%s", order_id, state)
             return
 
         # Сначала фиксируем переход в storage.
